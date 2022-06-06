@@ -1,0 +1,13 @@
+jvb/target/dependency/*		usr/share/confab-videobridge/lib
+jvb/lib/videobridge.rc		usr/share/confab-videobridge/lib
+jvb/lib/logging.properties		etc/confab/videobridge
+confab-videobridge.jar		usr/share/confab-videobridge
+jvb/resources/jvb.sh	usr/share/confab-videobridge
+resources/graceful_shutdown.sh	usr/share/confab-videobridge
+resources/collect-dump-logs.sh	usr/share/confab-videobridge
+
+# callstats-java-sdk
+config/callstats-java-sdk.properties	etc/confab/videobridge
+
+confab-videobridge			etc/logrotate.d
+config/20-jvb-udp-buffers.conf		etc/sysctl.d

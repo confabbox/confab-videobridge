@@ -1,0 +1,10 @@
+Template: confab-videobridge/jvb-hostname
+Type: string
+Default: localhost
+_Description: Hostname:
+ The confab-videobridge package needs the DNS hostname of your instance.
+
+Template: confab-videobridge/jvbsecret
+Type: password
+_Description: The secret used to connect to xmpp server as component
+  Component secret:

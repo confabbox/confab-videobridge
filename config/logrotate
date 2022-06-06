@@ -1,0 +1,12 @@
+/var/log/confab/jvb.log {
+  hourly
+  size 100M
+  missingok
+  rotate 24
+  compress
+  delaycompress
+  notifempty
+  copytruncate
+  su jvb confab
+}
+

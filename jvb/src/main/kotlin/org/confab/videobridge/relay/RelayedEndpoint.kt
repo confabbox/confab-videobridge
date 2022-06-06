@@ -1,0 +1,272 @@
+/*
+ * Copyright @ 2018 - present 8x8, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.confab.videobridge.relay
+
+import org.confab.nlj.Features
+import org.confab.nlj.MediaSourceDesc
+import org.confab.nlj.MediaSources
+import org.confab.nlj.PacketInfo
+import org.confab.nlj.RtpReceiverEventHandler
+import org.confab.nlj.RtpReceiverImpl
+import org.confab.nlj.SetLocalSsrcEvent
+import org.confab.nlj.SetMediaSourcesEvent
+import org.confab.nlj.format.PayloadType
+import org.confab.nlj.rtcp.RtcpEventNotifier
+import org.confab.nlj.rtcp.RtcpListener
+import org.confab.nlj.rtp.RtpExtension
+import org.confab.nlj.srtp.SrtpTransformers
+import org.confab.nlj.stats.NodeStatsBlock
+import org.confab.nlj.transform.node.ConsumerNode
+import org.confab.nlj.util.Bandwidth
+import org.confab.nlj.util.StreamInformationStore
+import org.confab.nlj.util.StreamInformationStoreImpl
+import org.confab.rtp.rtcp.RtcpPacket
+import org.confab.utils.MediaType
+import org.confab.utils.logging.DiagnosticContext
+import org.confab.utils.logging2.Logger
+import org.confab.utils.logging2.cdebug
+import org.confab.videobridge.AbstractEndpoint
+import org.confab.videobridge.Conference
+import org.confab.videobridge.MultiStreamConfig
+import org.confab.videobridge.cc.allocation.VideoConstraints
+import org.confab.videobridge.message.AddReceiverMessage
+import org.confab.videobridge.util.TaskPools
+import org.json.simple.JSONObject
+import java.time.Instant
+
+/**
+ * An object that handles media received from a single remote endpoint to a relay.
+ */
+class RelayedEndpoint(
+    conference: Conference,
+    val relay: Relay,
+    id: String,
+    parentLogger: Logger,
+    diagnosticContext: DiagnosticContext
+) : AbstractEndpoint(conference, id, parentLogger), Relay.IncomingRelayPacketHandler {
+    var audioSources: Array<AudioSourceDesc> = arrayOf()
+        set(value) {
+            field = value
+            value.forEach {
+                streamInformationStore.addReceiveSsrc(it.ssrc, MediaType.AUDIO)
+                conference.addEndpointSsrc(this, it.ssrc)
+            }
+        }
+
+    private val streamInformationStore: StreamInformationStore = StreamInformationStoreImpl()
+
+    val rtcpEventNotifier = RtcpEventNotifier().apply {
+        addRtcpEventListener(
+            object : RtcpListener {
+                override fun rtcpPacketReceived(packet: RtcpPacket, receivedTime: Instant?) {
+                    relay.rtcpPacketReceived(packet, receivedTime, id)
+                }
+                override fun rtcpPacketSent(packet: RtcpPacket) {
+                    throw IllegalStateException("got rtcpPacketSent callback from a receiver")
+                }
+            },
+            external = true
+        )
+    }
+
+    private val rtpReceiver = RtpReceiverImpl(
+        "${relay.id}-$id",
+        { rtcpPacket ->
+            if (rtcpPacket.length >= 1500) {
+                logger.warn(
+                    "Sending large locally-generated RTCP packet of size ${rtcpPacket.length}, " +
+                        "first packet of type ${rtcpPacket.packetType} rc ${rtcpPacket.reportCount}."
+                )
+            }
+            /* TODO */
+            relay.transceiver.sendPacket(PacketInfo(rtcpPacket))
+        },
+        rtcpEventNotifier,
+        TaskPools.CPU_POOL,
+        TaskPools.SCHEDULED_POOL,
+        streamInformationStore,
+        RtpReceiverEventHandlerImpl(),
+        logger,
+        diagnosticContext
+    ).apply {
+        packetHandler = object : ConsumerNode("receiver chain handler") {
+            override fun consume(packetInfo: PacketInfo) {
+                packetInfo.endpointId = id
+                conference.handleIncomingPacket(packetInfo)
+            }
+
+            override fun trace(f: () -> Unit) = f.invoke()
+        }
+        handleEvent(SetLocalSsrcEvent(MediaType.AUDIO, conference.localAudioSsrc))
+        handleEvent(SetLocalSsrcEvent(MediaType.VIDEO, conference.localVideoSsrc))
+    }
+
+    override fun receivesSsrc(ssrc: Long): Boolean {
+        return streamInformationStore.receiveSsrcs.contains(ssrc)
+    }
+
+    override fun getSsrcs() = HashSet(streamInformationStore.receiveSsrcs)
+
+    fun hasReceiveSsrcs(): Boolean = streamInformationStore.receiveSsrcs.isNotEmpty()
+
+    /** Relayed endpoints are not automatically expired. **/
+    override fun shouldExpire(): Boolean = false
+
+    override fun requestKeyframe(mediaSsrc: Long) = relay.transceiver.requestKeyFrame(mediaSsrc)
+
+    override fun requestKeyframe() = relay.transceiver.requestKeyFrame(mediaSource?.primarySSRC)
+
+    override fun isSendingAudio(): Boolean = rtpReceiver.isReceivingAudio()
+    override fun isSendingVideo(): Boolean = rtpReceiver.isReceivingVideo()
+
+    override fun addPayloadType(payloadType: PayloadType) = streamInformationStore.addRtpPayloadType(payloadType)
+    override fun addRtpExtension(rtpExtension: RtpExtension) =
+        streamInformationStore.addRtpExtensionMapping(rtpExtension)
+
+    override fun sendVideoConstraints(maxVideoConstraints: VideoConstraints) {
+        relay.sendMessage(
+            AddReceiverMessage(
+                RelayConfig.config.relayId,
+                id,
+                null, /* source name  - used in multi-stream */
+                maxVideoConstraints
+            )
+        )
+    }
+
+    override fun sendVideoConstraintsV2(sourceName: String, maxVideoConstraints: VideoConstraints) {
+        relay.sendMessage(
+            AddReceiverMessage(
+                RelayConfig.config.relayId,
+                null, // Endpoint ID - will be removed
+                sourceName,
+                maxVideoConstraints
+            )
+        )
+    }
+
+    fun relayMessageTransportConnected() {
+        if (MultiStreamConfig.config.enabled) {
+            maxReceiverVideoConstraintsMap.forEach {
+                    (sourceName, constraints) ->
+                sendVideoConstraintsV2(sourceName, constraints)
+            }
+        } else {
+            sendVideoConstraints(maxReceiverVideoConstraints)
+        }
+    }
+
+    private val _mediaSources = MediaSources()
+
+    override val mediaSource: MediaSourceDesc?
+        get() = mediaSources.getOrNull(0)
+    override var mediaSources: Array<MediaSourceDesc>
+        get() = _mediaSources.getMediaSources()
+        set(value) {
+            if (MultiStreamConfig.config.enabled) {
+                applyVideoTypeCache(value)
+            }
+            val changed = _mediaSources.setMediaSources(value)
+            if (changed) {
+                val setMediaSourcesEvent = SetMediaSourcesEvent(mediaSources)
+
+                rtpReceiver.handleEvent(setMediaSourcesEvent)
+                mediaSources.forEach {
+                    it.rtpEncodings.forEach {
+                        it.ssrcs.forEach {
+                            streamInformationStore.addReceiveSsrc(it, MediaType.VIDEO)
+                            conference.addEndpointSsrc(this, it)
+                        }
+                    }
+                }
+            }
+        }
+
+    fun setSrtpInformation(srtpTransformers: SrtpTransformers) {
+        rtpReceiver.setSrtpTransformers(srtpTransformers)
+    }
+
+    override fun handleIncomingPacket(packetInfo: RelayedPacketInfo) = rtpReceiver.processPacket(packetInfo)
+
+    fun setFeature(feature: Features, enabled: Boolean) {
+        rtpReceiver.setFeature(feature, enabled)
+    }
+
+    fun getIncomingStats() = rtpReceiver.getStats().packetStreamStats
+
+    fun getNodeStats(): NodeStatsBlock {
+        return NodeStatsBlock("Remote Endpoint $id").apply {
+            addBlock(streamInformationStore.getNodeStats())
+            addBlock(_mediaSources.getNodeStats())
+            addBlock(rtpReceiver.getNodeStats())
+        }
+    }
+
+    override fun getDebugState(): JSONObject {
+        return super.getDebugState().apply {
+            val block = getNodeStats()
+            put(block.name, block.toJson())
+        }
+    }
+
+    private fun updateStatsOnExpire() {
+        val relayStats = relay.statistics
+        val rtpReceiverStats = rtpReceiver.getStats()
+
+        // Add stats from the local transceiver
+        val incomingStats = rtpReceiverStats.packetStreamStats
+
+        relayStats.apply {
+            bytesReceived.getAndAdd(incomingStats.bytes)
+            packetsReceived.getAndAdd(incomingStats.packets)
+        }
+    }
+
+    override fun expire() {
+        if (super.isExpired()) {
+            return
+        }
+        super.expire()
+
+        try {
+            updateStatsOnExpire()
+            rtpReceiver.stop()
+            logger.cdebug { getNodeStats().prettyPrint(0) }
+            rtpReceiver.tearDown()
+        } catch (t: Throwable) {
+            logger.error("Exception while expiring: ", t)
+        }
+
+        logger.info("Expired.")
+    }
+
+    private inner class RtpReceiverEventHandlerImpl : RtpReceiverEventHandler {
+        /**
+         * Forward audio level events from the Transceiver to the conference. We use the same thread, because this fires
+         * for every packet and we want to avoid the switch. The conference audio level code must not block.
+         */
+        override fun audioLevelReceived(sourceSsrc: Long, level: Long): Boolean =
+            conference.levelChanged(this@RelayedEndpoint, level)
+
+        /**
+         * Forward bwe events from the Transceiver.
+         */
+        override fun bandwidthEstimationChanged(newValue: Bandwidth) {
+            logger.cdebug { "Estimated bandwidth is now $newValue" }
+            /* We don't use BWE for relay connections. */
+        }
+    }
+}

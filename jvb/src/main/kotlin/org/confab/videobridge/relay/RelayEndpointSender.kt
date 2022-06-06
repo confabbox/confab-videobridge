@@ -1,0 +1,172 @@
+/*
+ * Copyright @ 2018 - present 8x8, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.confab.videobridge.relay
+
+import org.confab.nlj.Features
+import org.confab.nlj.PacketHandler
+import org.confab.nlj.PacketInfo
+import org.confab.nlj.RtpSender
+import org.confab.nlj.RtpSenderImpl
+import org.confab.nlj.format.PayloadType
+import org.confab.nlj.rtcp.RtcpEventNotifier
+import org.confab.nlj.rtcp.RtcpListener
+import org.confab.nlj.rtp.RtpExtension
+import org.confab.nlj.srtp.SrtpTransformers
+import org.confab.nlj.stats.NodeStatsBlock
+import org.confab.nlj.util.PacketInfoQueue
+import org.confab.nlj.util.StreamInformationStore
+import org.confab.nlj.util.StreamInformationStoreImpl
+import org.confab.rtp.rtcp.RtcpPacket
+import org.confab.utils.logging.DiagnosticContext
+import org.confab.utils.logging2.Logger
+import org.confab.utils.logging2.cdebug
+import org.confab.utils.logging2.createChildLogger
+import org.confab.utils.queue.CountingErrorHandler
+import org.confab.videobridge.TransportConfig
+import org.confab.videobridge.transport.ice.IceTransport
+import org.confab.videobridge.util.TaskPools
+import org.json.simple.JSONObject
+import java.time.Instant
+
+/**
+ * An object that sends media from a single local endpoint to a single remote relay.
+ */
+class RelayEndpointSender(
+    val relay: Relay,
+    val id: String,
+    parentLogger: Logger,
+    diagnosticContext: DiagnosticContext
+) {
+    private val logger = createChildLogger(parentLogger)
+
+    private val streamInformationStore: StreamInformationStore = StreamInformationStoreImpl()
+
+    val rtcpEventNotifier = RtcpEventNotifier().apply {
+        addRtcpEventListener(
+            object : RtcpListener {
+                override fun rtcpPacketReceived(packet: RtcpPacket, receivedTime: Instant?) {
+                    throw IllegalStateException("got rtcpPacketReceived callback from a sender")
+                }
+                override fun rtcpPacketSent(packet: RtcpPacket) {
+                    relay.rtcpPacketSent(packet, id)
+                }
+            },
+            external = true
+        )
+    }
+
+    private val rtpSender: RtpSender = RtpSenderImpl(
+        "${relay.id}-$id",
+        rtcpEventNotifier,
+        TaskPools.CPU_POOL,
+        TaskPools.SCHEDULED_POOL,
+        streamInformationStore,
+        logger,
+        diagnosticContext
+    ).apply {
+        onOutgoingPacket(object : PacketHandler {
+            override fun processPacket(packetInfo: PacketInfo) {
+                packetInfo.addEvent(SRTP_QUEUE_ENTRY_EVENT)
+                outgoingSrtpPacketQueue.add(packetInfo)
+            }
+        })
+    }
+
+    /**
+     * The queue we put outgoing SRTP packets onto so they can be sent
+     * out via the Relay's [IceTransport] on an IO thread.
+     */
+    private val outgoingSrtpPacketQueue = PacketInfoQueue(
+        "${javaClass.simpleName}-outgoing-packet-queue",
+        TaskPools.IO_POOL,
+        { packet -> relay.doSendSrtp(packet) },
+        TransportConfig.queueSize
+    ).apply {
+        setErrorHandler(queueErrorCounter)
+    }
+
+    private var expired = false
+
+    fun addPayloadType(payloadType: PayloadType) = streamInformationStore.addRtpPayloadType(payloadType)
+    fun addRtpExtension(rtpExtension: RtpExtension) = streamInformationStore.addRtpExtensionMapping(rtpExtension)
+
+    fun setSrtpInformation(srtpTransformers: SrtpTransformers) {
+        rtpSender.setSrtpTransformers(srtpTransformers)
+    }
+
+    fun sendPacket(packetInfo: PacketInfo) = rtpSender.processPacket(packetInfo)
+
+    fun setFeature(feature: Features, enabled: Boolean) {
+        rtpSender.setFeature(feature, enabled)
+    }
+
+    fun getOutgoingStats() = rtpSender.getPacketStreamStats()
+
+    fun getNodeStats(): NodeStatsBlock {
+        return NodeStatsBlock("Remote Endpoint $id").apply {
+            addBlock(streamInformationStore.getNodeStats())
+            addBlock(rtpSender.getNodeStats())
+        }
+    }
+
+    fun getDebugState(): JSONObject {
+        val debugState = JSONObject()
+        debugState["expired"] = expired
+
+        val block = getNodeStats()
+        debugState[block.name] = block.toJson()
+
+        return debugState
+    }
+
+    fun expire() {
+        if (expired) {
+            return
+        }
+        expired = true
+
+        try {
+            updateStatsOnExpire()
+            rtpSender.stop()
+            logger.cdebug { getNodeStats().prettyPrint(0) }
+            rtpSender.tearDown()
+        } catch (t: Throwable) {
+            logger.error("Exception while expiring: ", t)
+        }
+        outgoingSrtpPacketQueue.close()
+    }
+
+    private fun updateStatsOnExpire() {
+        val relayStats = relay.statistics
+        val outgoingStats = rtpSender.getPacketStreamStats()
+
+        relayStats.apply {
+            bytesSent.getAndAdd(outgoingStats.bytes)
+            packetsSent.getAndAdd(outgoingStats.packets)
+        }
+    }
+
+    companion object {
+        /**
+         * Count the number of dropped packets and exceptions.
+         */
+        @JvmField
+        val queueErrorCounter = CountingErrorHandler()
+
+        private const val SRTP_QUEUE_ENTRY_EVENT = "Entered RelayEndpointSender SRTP sender outgoing queue"
+    }
+}

@@ -1,0 +1,56 @@
+/*
+ * Copyright @ 2020 - Present, 8x8, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.confab.videobridge
+
+import io.kotest.matchers.shouldBe
+import io.mockk.every
+import io.mockk.mockk
+import org.confab.ConfigTest
+import org.json.simple.JSONObject
+import org.json.simple.parser.JSONParser
+import org.jxmpp.jid.impl.JidCreate
+
+/**
+ * This is a high-level test for [Conference] and related functionality.
+ */
+class ConferenceTest : ConfigTest() {
+    private val videobridge = mockk<Videobridge>(relaxed = true) {
+        every { statistics } returns Videobridge.Statistics()
+    }
+
+    init {
+        val name = JidCreate.entityBareFrom("roomName@somedomain.com")
+
+        context("Adding local endpoints should work") {
+            with(Conference(videobridge, "id", name, null, false, false)) {
+                endpointCount shouldBe 0
+                createLocalEndpoint("abcdabcd", true, false) // TODO cover the case when it's true
+                endpointCount shouldBe 1
+                debugState.shouldBeValidJson()
+            }
+        }
+        context("Creating relays should work") {
+            with(Conference(videobridge, "id", name, null, false, false)) {
+                hasRelays() shouldBe false
+                createRelay("relay-id", "mesh-id", true, true)
+                hasRelays() shouldBe true
+                debugState.shouldBeValidJson()
+            }
+        }
+    }
+}
+
+fun JSONObject.shouldBeValidJson() = JSONParser().parse(this.toJSONString())

@@ -1,0 +1,27 @@
+[Unit]
+Description=Confab Videobridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+SuccessExitStatus=143
+# allow bind to 80 and 443
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+EnvironmentFile=/etc/confab/videobridge/config
+Environment=LOGFILE=/var/log/confab/jvb.log
+User=jvb
+RuntimeDirectory=confab-videobridge
+RuntimeDirectoryMode=0750
+PIDFile=/var/run/confab-videobridge/confab-videobridge.pid
+# more threads for this process
+TasksMax=65000
+# allow more open files for this process
+LimitNPROC=65000
+LimitNOFILE=65000
+ExecStart=/bin/bash -c "exec /usr/share/confab-videobridge/jvb.sh ${JVB_OPTS} < /dev/null >> ${LOGFILE} 2>&1"
+ExecStartPost=/bin/bash -c "echo $MAINPID > /var/run/confab-videobridge/confab-videobridge.pid"
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
